@@ -1,5 +1,5 @@
 {
-  "name": "ui-fx-unified",
+  "name": "quantum-text",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -8,8 +8,6 @@
     "build":   "vite build",
     "preview": "vite preview"
   },
-  "devDependencies": {
-    "typescript": "^5.5.3",
-    "vite":       "^5.3.4"
-  }
+  "dependencies": { "three": "^0.168.0" },
+  "devDependencies": { "vite": "^5.3.4" }
 }
