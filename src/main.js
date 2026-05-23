@@ -4,125 +4,144 @@ import { RenderPass }      from 'three/examples/jsm/postprocessing/RenderPass.js
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
 import { OutputPass }      from 'three/examples/jsm/postprocessing/OutputPass.js'
 
-/* ════════════════════════════════════════════════════════════════
-   QUANTUM TEXT  —  production particle word
-   ┌─────────────────────────────────────────────────────────────┐
-   │  • Word morphing   particles flow between 5 words          │
-   │  • Post-process bloom  real luminous glow (UnrealBloom)    │
-   │  • Custom cursor   spring-lag ring, proximity expansion    │
-   │  • ±Charged field  attract/repel around cursor             │
-   │  • Scroll rotation 3D Y-axis pivot, springs back           │
-   │  • Camera parallax mouse tilts 3D depth                    │
-   │  • Fibonacci sphere  intro + explode target               │
-   │  • Visibility fix  correct perspective px size + alpha     │
-   └─────────────────────────────────────────────────────────────┘
-════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════
+   PRODUCTION PARTICLE TEXT
+   ─────────────────────────────────────────────────────────────────
+   SCROLL  → physically drag morphT 0→1 (release snaps fwd or back)
+   CLICK   → instant morph to next word
+   AUTO    → fires after 5s of no interaction
+   BLOOM   → UnrealBloomPass — particles glow like real light
+   CURSOR  → spring-lag ring, expands near text, pulses on click
+   MORPH   → particles physically flow between words in vertex shader
+   CHARGED → ±polarity per particle → attract / repel cursor
+   PARALLAX→ camera tilts with mouse, reveals true Z depth
+   SHOCKWAVE → CSS ring fires on every morph complete
+   PER-WORD COLOUR → each word has own hue family + bloom tint
+═══════════════════════════════════════════════════════════════════ */
 
-const WORDS = ['QUANTUM', 'DESIGN', 'CREATE', 'EVOLVE', 'IGNITE']
+// ── Word config ───────────────────────────────────────────────
+// Change words HERE — all caps only
+const WORDS = ['CURIOUS', 'BOLD', 'THOUGHTFUL', 'RESILIENT', 'DRIVEN']
+// Per-word identity hue (0–360) — drives particle colour + bloom colour
+const WORD_HUES = [235, 355, 172, 44, 288]   // indigo, red-pink, teal, amber, violet
 
-// ── Vertex shader ─────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+//  GLSL — VERTEX
+// ════════════════════════════════════════════════════════════════
 const VERT = `
-  attribute vec3  aOriginA;   // current word  target
-  attribute vec3  aOriginB;   // next word target
-  attribute vec3  aSphere;    // sphere (intro + explode)
-  attribute float aSize;      // base size (world units)
-  attribute float aCharge;    // +1 repel / -1 attract
-  attribute float aDelay;     // intro stagger 0..1
-  attribute float aHue;       // per-particle hue shift
-  attribute float aPhase;     // breathing phase
+  attribute vec3  aOriginA;    // current word world pos
+  attribute vec3  aOriginB;    // next word world pos
+  attribute vec3  aSphere;     // fibonacci sphere (intro + explode)
+  attribute float aSize;       // base size (calibrated world units)
+  attribute float aCharge;     // +1 repel cursor  |  -1 attract
+  attribute float aDelay;      // intro stagger 0..1
+  attribute float aHue;        // per-particle hue offset 0..1
+  attribute float aPhase;      // breathing phase
 
   uniform float uTime;
-  uniform float uIntro;       // 0→1 : sphere → text
-  uniform float uMorphT;      // 0→1 : word A → word B
-  uniform float uExplode;     // 0→1 : text → sphere scatter
-  uniform vec2  uMouse;       // NDC -1..1
-  uniform float uScrollRot;   // Y rotation (radians)
+  uniform float uIntro;        // 0→1: sphere collapses into word
+  uniform float uMorphT;       // 0→1: word A → word B (scroll/click)
+  uniform float uExplode;      // reserved (0 in this build)
+  uniform vec2  uMouse;        // NDC mouse -1..1
+  uniform float uScrollRot;    // Y-axis rotation from scroll (radians)
   uniform vec2  uRes;
+  uniform float uWordHueA;     // current word hue 0..1
+  uniform float uWordHueB;     // next word hue 0..1
 
   varying float vProx;
   varying float vHue;
   varying float vAlpha;
+  varying float vWordHue;
 
-  // Hash-based value noise (lighter than snoise)
+  // ── Value noise (lightweight) ─────────────────────────
   float h21(vec2 p){ p=fract(p*vec2(234.34,435.345)); p+=dot(p,p+34.23); return fract(p.x*p.y); }
   float vnoise(vec2 p){
-    vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
-    return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);
+    vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+    return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),
+               mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);
   }
 
   float easeOutExpo(float x){ return x>=1.?1.:1.-pow(2.,-10.*x); }
   float easeInOutCubic(float x){ return x<.5?4.*x*x*x:1.-pow(-2.*x+2.,3.)/2.; }
+  float easeOutBack(float x){
+    float c1=1.70158, c3=c1+1.;
+    return 1.+c3*pow(x-1.,3.)+c1*pow(x-1.,2.);
+  }
 
   void main(){
-    // ── Staggered intro ───────────────────────────────────
-    float si    = clamp((uIntro - aDelay*0.38)/0.62, 0.,1.);
+    // ── Staggered intro ──────────────────────────────────
+    float si    = clamp((uIntro - aDelay*0.36)/0.64, 0.,1.);
     float intro = easeOutExpo(si);
 
-    // ── Morph: blend between word A and word B ────────────
-    float morphE = easeInOutCubic(clamp(uMorphT,0.,1.));
-    vec3  origin = mix(aOriginA, aOriginB, morphE);
+    // ── Morph blend A→B ─────────────────────────────────
+    float mt     = easeInOutCubic(clamp(uMorphT,0.,1.));
+    vec3  origin = mix(aOriginA, aOriginB, mt);
 
-    // ── Scroll Y-rotation applied to the blended origin ───
+    // ── Scroll Y-rotation on origin ──────────────────────
     float cr=cos(uScrollRot), sr=sin(uScrollRot);
-    vec3 rotOrigin = vec3(
+    vec3 rotO = vec3(
       origin.x*cr - origin.z*sr,
       origin.y,
       origin.x*sr + origin.z*cr
     );
 
-    // ── Position: sphere→text (intro), text→sphere (explode)
-    vec3 pos = mix(aSphere, rotOrigin, intro);
-    pos       = mix(pos, aSphere*1.45, easeInOutCubic(uExplode));
+    // ── Sphere → text (intro) ────────────────────────────
+    // During morph: add mid-flight arc — particles lift in Z then drop
+    float arcZ = sin(mt*3.14159) * 0.35 * (1.0 - abs(mt-0.5)*1.8);
+    vec3  morphOffset = vec3(0., sin(mt*3.14159)*0.10, arcZ);
+    vec3  pos = mix(aSphere, rotO + morphOffset, intro);
 
-    // ── Organic drift when settled ────────────────────────
-    float settled = intro * (1.-uExplode) * (1.-morphE);
-    float noise   = vnoise(origin.xy*1.1 + vec2(uTime*.13, uTime*.10)) - 0.5;
-    pos.x += noise * .013 * settled;
-    pos.y += noise * .009 * settled;
+    // ── Organic micro-drift when fully settled ───────────
+    float settled = intro * (1.-mt) * (1.-uExplode);
+    float n = vnoise(origin.xy*1.05 + vec2(uTime*.12,uTime*.09)) - 0.5;
+    pos.x += n*.012*settled;
+    pos.y += n*.008*settled;
 
-    // ── Cursor proximity force ────────────────────────────
+    // ── Cursor proximity (charged field) ─────────────────
     vec4  proj   = projectionMatrix * modelViewMatrix * vec4(pos,1.);
     vec2  ndc    = proj.xy/proj.w;
     float aspect = uRes.x/uRes.y;
     vec2  diff   = vec2((ndc.x-uMouse.x)*aspect, ndc.y-uMouse.y);
     float md     = length(diff);
-    float prox   = max(0.,1.-md/0.36) * intro * (1.-uExplode*.9) * (1.-morphE*.7);
+    float prox   = max(0.,1.-md/0.38) * intro * (1.-mt*0.75);
 
-    // Charge: push or pull, hard-clamped
-    float mag  = aCharge * prox*prox * 0.058;
-    float clampedMag = clamp(abs(mag),0.,.044)*sign(mag);
-    pos += normalize(vec3(diff/aspect, prox*.18)) * clampedMag;
-
+    // Clamp force so particles stay legible
+    float fMag   = aCharge * prox*prox * 0.056;
+    float fClamp = clamp(abs(fMag),0.,.042)*sign(fMag);
+    pos += normalize(vec3(diff/aspect, prox*.16)) * fClamp;
     vProx = prox;
 
-    // ── Camera parallax ───────────────────────────────────
-    pos.x += uMouse.x * pos.z * .036;
-    pos.y += uMouse.y * pos.z * .022;
+    // ── Camera parallax ──────────────────────────────────
+    pos.x += uMouse.x * pos.z * .034;
+    pos.y += uMouse.y * pos.z * .020;
 
-    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    vec4 mv = modelViewMatrix * vec4(pos,1.);
     gl_Position = projectionMatrix * mv;
 
-    // ── Point size — calibrated for fov=45, cam z=4.8 ────
-    // projMatrix[1][1] = 1/tan(fov/2) = 2.414 for fov=45
-    // target px = aSize * projMatrix[1][1] * res.y*0.5 / (-mv.z)
-    // aSize=0.012 → ~2.7px at z=4.8  ✓
-    float swell = 1.0 + prox*1.25 + .14*sin(uTime*1.75+aPhase)*intro*(1.-morphE*.5);
+    // ── Point size ───────────────────────────────────────
+    // Calibrated: aSize(0.010–0.016) × 2.414 × H×0.5 / (-mv.z)
+    // → 2–4px at cam z=4.8, H=900
+    float swell = 1.0 + prox*1.20 + .12*sin(uTime*1.75+aPhase)*intro*(1.-mt*.6);
     gl_PointSize = aSize * swell * 2.414 * uRes.y * 0.5 / (-mv.z);
 
-    vHue   = aHue;
-    // Alpha: calibrated so 10 overlap → ~0.90 brightness (just below white)
-    // Single particle visible at base 0.08
-    vAlpha = intro * (0.08 + prox*0.22) * (1.0 - morphE*0.3);
+    // ── Varyings ─────────────────────────────────────────
+    vHue     = aHue;
+    vWordHue = mix(uWordHueA, uWordHueB, mt);
+    // Alpha: base 0.08 → ~10 overlap = 0.80 brightness (visible, not white)
+    vAlpha   = intro * (0.08 + prox*0.20);
   }
 `
 
-// ── Fragment shader ───────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+//  GLSL — FRAGMENT
+// ════════════════════════════════════════════════════════════════
 const FRAG = `
   precision highp float;
   uniform float uTime;
   varying float vProx;
   varying float vHue;
   varying float vAlpha;
+  varying float vWordHue;
 
   vec3 hsl2rgb(float h,float s,float l){
     vec3 c=clamp(abs(mod(h*6.+vec3(0,4,2),6.)-3.)-1.,0.,1.);
@@ -130,77 +149,69 @@ const FRAG = `
   }
 
   void main(){
-    vec2  uv = gl_PointCoord - .5;
+    vec2  uv = gl_PointCoord-.5;
     float d  = length(uv)*2.;
 
-    // Hard-edged circle — visible as individual dots at low density
-    // Bloom pass will add the soft luminous halo; no fake halo here
-    float circ = 1.-smoothstep(0.35, 0.80, d);
+    // Hard circle — individual dots visible at letter edges
+    // Bloom pass adds the luminous halo; NO fake soft halo here
+    float circ = 1.-smoothstep(0.30, 0.85, d);
     if(circ < 0.015) discard;
 
-    // Colour: indigo–violet–cyan family only
-    float hue = mod(0.638 + vHue*0.085 + uTime*0.007, 1.0);
-    float sat = 0.82 - vProx*0.18;
-    float lit = 0.50 + vProx*0.32;    // 0.50 base → bloom will lift it
+    // Colour driven by word hue family + per-particle shift + time drift
+    float hue = mod(vWordHue + vHue*0.08 + uTime*0.006, 1.0);
+    float sat = 0.85 - vProx*0.20;
+    float lit = 0.48 + vProx*0.30;   // 0.48 base → bloom lifts luminance
 
     vec3 col = hsl2rgb(hue, sat, lit);
 
-    // Tight proximity core — electric white-blue centre
-    float core = max(0., 1.-d*2.4) * vProx * 0.60;
-    col += vec3(0.25,0.45,1.0) * core;
+    // Tight proximity electric core (very centre only)
+    float core = max(0., 1.-d*2.5) * vProx * 0.55;
+    col += mix(vec3(0.2,0.4,1.0), vec3(1.0,0.8,0.4), vWordHue) * core;
 
-    // Output: standard alpha — let THREE.AdditiveBlending stack naturally
     gl_FragColor = vec4(col, circ * vAlpha);
   }
 `
 
-// ═══════════════════════════════════════════════════════════════
-// Utilities
-// ═══════════════════════════════════════════════════════════════
-
-// Sample 2D canvas text → world positions
+// ════════════════════════════════════════════════════════════════
+//  UTILITIES
+// ════════════════════════════════════════════════════════════════
 function sampleRaw(text) {
-  const W=1400, H=360, RES=5
-  const cvs=Object.assign(document.createElement('canvas'),{width:W,height:H})
-  const ctx=cvs.getContext('2d')
-  ctx.font='900 188px "Bebas Neue",Impact,sans-serif'
-  ctx.textAlign='center'; ctx.textBaseline='middle'
-  ctx.fillStyle='#fff'
-  ctx.fillText(text,W/2,H/2)
-  const data=ctx.getImageData(0,0,W,H).data
-  const SX=5.0/W, SY=(5.0*H/W)/H
-  const pts=[]
+  const W=1500, H=380, RES=5
+  const cvs = Object.assign(document.createElement('canvas'),{width:W,height:H})
+  const ctx  = cvs.getContext('2d')
+  ctx.font          = '900 192px "Bebas Neue",Impact,sans-serif'
+  ctx.textAlign     = 'center'
+  ctx.textBaseline  = 'middle'
+  ctx.fillStyle     = '#fff'
+  ctx.fillText(text, W/2, H/2)
+  const data = ctx.getImageData(0,0,W,H).data
+  const SX   = 5.2/W, SY=(5.2*H/W)/H
+  const pts  = []
   for(let y=0;y<H;y+=RES)
     for(let x=0;x<W;x+=RES)
       if(data[(y*W+x)*4+3]>110)
-        pts.push((x-W/2)*SX, -(y-H/2)*SY, (Math.random()-.5)*.40)
+        pts.push((x-W/2)*SX, -(y-H/2)*SY, (Math.random()-.5)*.42)
   return pts
 }
 
-// Pad/truncate to exact count N
-// (extra particles repeat random existing ones with tiny jitter)
 function padToN(pts, N) {
-  const srcN = pts.length/3
-  const out  = new Float32Array(N*3)
-  // copy as many as we have
-  const copy = Math.min(srcN, N)
-  for(let i=0;i<copy*3;i++) out[i]=pts[i]
-  // pad remainder by repeating random samples
-  for(let i=copy;i<N;i++){
-    const s=Math.floor(Math.random()*srcN)*3
-    out[i*3]   = pts[s]   + (Math.random()-.5)*.04
-    out[i*3+1] = pts[s+1] + (Math.random()-.5)*.04
+  const src = pts.length/3
+  const out = new Float32Array(N*3)
+  for(let i=0; i<Math.min(src,N)*3; i++) out[i]=pts[i]
+  for(let i=src; i<N; i++){
+    const s = Math.floor(Math.random()*src)*3
+    out[i*3]   = pts[s]   + (Math.random()-.5)*.06
+    out[i*3+1] = pts[s+1] + (Math.random()-.5)*.06
     out[i*3+2] = pts[s+2]
   }
   return out
 }
 
-// Fibonacci sphere
-function makeSphere(N, r=1.85){
+function makeSphere(N, r=1.90){
   const a=new Float32Array(N*3), P=Math.PI*(1+Math.sqrt(5))
   for(let i=0;i<N;i++){
     const phi=Math.acos(1-(2*(i+.5))/N), th=P*i
-    const ri=r*(.5+Math.random()*.6)
+    const ri=r*(.45+Math.random()*.65)
     a[i*3]  =ri*Math.sin(phi)*Math.cos(th)
     a[i*3+1]=ri*Math.sin(phi)*Math.sin(th)
     a[i*3+2]=ri*Math.cos(phi)
@@ -208,121 +219,111 @@ function makeSphere(N, r=1.85){
   return a
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Custom Cursor
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  CURSOR
+// ════════════════════════════════════════════════════════════════
 class Cursor {
   constructor(){
-    this.x=-200; this.y=-200
-    this.rx=-200; this.ry=-200
-    this.rvx=0; this.rvy=0
-    this.visible=false
+    this.x=-400; this.y=-400
+    this.rx=-400; this.ry=-400
+    this.rvx=0;   this.rvy=0
     this.dot  = document.getElementById('cur-dot')
     this.ring = document.getElementById('cur-ring')
   }
-
-  setPos(x,y){
-    this.x=x; this.y=y
-    if(!this.visible){ this.visible=true; this.rx=x; this.ry=y }
+  move(x,y){ this.x=x; this.y=y }
+  hide(){ this.x=-400; this.y=-400 }
+  update(dt, nearPct){
+    const SP=0.13, DP=0.70
+    this.rvx=this.rvx*DP+(this.x-this.rx)*SP
+    this.rvy=this.rvy*DP+(this.y-this.ry)*SP
+    this.rx+=this.rvx; this.ry+=this.rvy
+    this.dot.style.transform =`translate(calc(${this.x}px - 50%),calc(${this.y}px - 50%))`
+    this.ring.style.transform=`translate(calc(${this.rx}px - 50%),calc(${this.ry}px - 50%))`
+    this.ring.classList.toggle('near', nearPct>0.08)
   }
-
-  hide(){ this.x=-200; this.y=-200 }
-
-  // Call every frame with dt in seconds
-  update(dt, nearText){
-    const SP=0.14, DP=0.72
-    this.rvx = this.rvx*DP + (this.x - this.rx)*SP
-    this.rvy = this.rvy*DP + (this.y - this.ry)*SP
-    this.rx += this.rvx
-    this.ry += this.rvy
-
-    // Dot snaps exactly to mouse
-    this.dot.style.transform  = `translate(calc(${this.x}px - 50%), calc(${this.y}px - 50%))`
-    // Ring lags behind
-    this.ring.style.transform = `translate(calc(${this.rx}px - 50%), calc(${this.ry}px - 50%))`
-
-    // Proximity expansion
-    this.ring.classList.toggle('near', nearText > 0.05)
-  }
-
   click(){
-    this.ring.classList.add('clicking')
-    setTimeout(()=>this.ring.classList.remove('clicking'), 200)
+    this.ring.classList.add('click')
+    setTimeout(()=>this.ring.classList.remove('click'),180)
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Bootstrap
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SHOCKWAVE
+// ════════════════════════════════════════════════════════════════
+function fireShockwave(){
+  const el = document.getElementById('shock')
+  el.classList.remove('fire')
+  void el.offsetWidth   // reflow to restart animation
+  el.classList.add('fire')
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MAIN
+// ════════════════════════════════════════════════════════════════
 async function init(){
-  // Wait for Bebas Neue
-  try{ await document.fonts.load('900 188px "Bebas Neue"') }catch(e){}
-  await new Promise(r=>setTimeout(r,100))
+  try{ await document.fonts.load('900 192px "Bebas Neue"') }catch(e){}
+  await new Promise(r=>setTimeout(r,80))
 
-  // ── Sample all words ───────────────────────────────────
-  console.log('[Quantum] Sampling words...')
-  const rawWords = WORDS.map(w=>sampleRaw(w))
-  const N = Math.round(Math.max(...rawWords.map(r=>r.length/3)) * 1.05)
-  const wordPositions = rawWords.map(r=>padToN(r,N))
-  console.log(`[Quantum] ${N} particles, ${WORDS.length} words`)
-
-  // ── Three.js setup ─────────────────────────────────────
-  const canvas = document.getElementById('c')
   const W=()=>window.innerWidth, H=()=>window.innerHeight
   const DPR=Math.min(devicePixelRatio??1,2)
 
-  const renderer = new THREE.WebGLRenderer({canvas, antialias:false, alpha:false, powerPreference:'high-performance'})
+  // ── Sample all words upfront ────────────────────────────
+  console.log('[FX] Sampling words...')
+  const rawWords = WORDS.map(w => sampleRaw(w))
+  const N = Math.round(Math.max(...rawWords.map(r=>r.length/3)) * 1.08)
+  const wordPos = rawWords.map(r => padToN(r,N))
+  console.log(`[FX] ${N} particles, ${WORDS.length} words`)
+
+  // ── Renderer ────────────────────────────────────────────
+  const canvas = document.getElementById('c')
+  const renderer = new THREE.WebGLRenderer({
+    canvas, antialias:false, alpha:false, powerPreference:'high-performance'
+  })
   renderer.setSize(W(),H())
   renderer.setPixelRatio(DPR)
-  renderer.setClearColor(0x04040a,1)
+  renderer.setClearColor(0x030308,1)
   renderer.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.toneMappingExposure = 1.0
+  renderer.toneMappingExposure = 1.05
 
-  const scene  = new THREE.Scene()
-  scene.fog    = new THREE.FogExp2(0x04040a, 0.16)
+  const scene = new THREE.Scene()
+  scene.fog   = new THREE.FogExp2(0x030308, 0.15)
 
-  const cam = new THREE.PerspectiveCamera(45, W()/H(), 0.1, 20)
+  const cam = new THREE.PerspectiveCamera(45,W()/H(),0.1,20)
   cam.position.set(0,0,4.8)
   const camBase = cam.position.clone()
 
-  // ── Post-processing: Bloom ─────────────────────────────
+  // ── Post-processing bloom ───────────────────────────────
   const composer = new EffectComposer(renderer)
-  composer.addPass(new RenderPass(scene, cam))
-
-  const bloomPass = new UnrealBloomPass(
-    new THREE.Vector2(W()*DPR, H()*DPR),
-    1.35,   // strength  — luminous but not blinding
-    0.55,   // radius    — soft spread
-    0.10    // threshold — picks up even dim particles
+  composer.addPass(new RenderPass(scene,cam))
+  const bloom = new UnrealBloomPass(
+    new THREE.Vector2(W()*DPR,H()*DPR),
+    1.25,   // strength — luminous, not blinding
+    0.52,   // radius
+    0.08    // threshold — catches even dim particles
   )
-  composer.addPass(bloomPass)
+  composer.addPass(bloom)
   composer.addPass(new OutputPass())
 
-  // ── Particle geometry ──────────────────────────────────
-  const geo = new THREE.BufferGeometry()
+  // ── Geometry ────────────────────────────────────────────
+  const geo       = new THREE.BufferGeometry()
   const spherePos = makeSphere(N)
-
-  const aSize  = new Float32Array(N)
-  const aChg   = new Float32Array(N)
-  const aDel   = new Float32Array(N)
-  const aHue   = new Float32Array(N)
-  const aPh    = new Float32Array(N)
+  const aSize     = new Float32Array(N)
+  const aChg      = new Float32Array(N)
+  const aDel      = new Float32Array(N)
+  const aHue      = new Float32Array(N)
+  const aPh       = new Float32Array(N)
 
   for(let i=0;i<N;i++){
-    // ★ Key visibility fix: aSize in world units calibrated to ~2-4px at cam z=4.8
-    // Formula: px = aSize * 2.414 * H*0.5 / 4.8
-    // Target 3px → aSize = 3 * 4.8 / (2.414 * H*0.5) ≈ 0.012 at H=900
-    aSize[i] = 0.010 + Math.random()*0.006   // 0.010–0.016 → ~2–4px
-    aChg[i]  = Math.random()<.38?-1:1
+    aSize[i] = 0.010 + Math.random()*0.006  // → ~2–4px at cam z=4.8
+    aChg[i]  = Math.random()<.38 ? -1 : 1
     aDel[i]  = Math.random()
     aHue[i]  = Math.random()
     aPh[i]   = Math.random()*Math.PI*2
   }
 
-  // Start: originA = word 0, originB = word 0 (no morph yet)
   geo.setAttribute('position', new THREE.BufferAttribute(spherePos.slice(),3))
-  geo.setAttribute('aOriginA', new THREE.BufferAttribute(wordPositions[0].slice(),3))
-  geo.setAttribute('aOriginB', new THREE.BufferAttribute(wordPositions[0].slice(),3))
+  geo.setAttribute('aOriginA', new THREE.BufferAttribute(wordPos[0].slice(),3))
+  geo.setAttribute('aOriginB', new THREE.BufferAttribute(wordPos[0].slice(),3))
   geo.setAttribute('aSphere',  new THREE.BufferAttribute(spherePos,3))
   geo.setAttribute('aSize',    new THREE.BufferAttribute(aSize,1))
   geo.setAttribute('aCharge',  new THREE.BufferAttribute(aChg,1))
@@ -338,88 +339,119 @@ async function init(){
     uMouse:     {value:new THREE.Vector2(0,0)},
     uScrollRot: {value:0},
     uRes:       {value:new THREE.Vector2(W(),H())},
+    uWordHueA:  {value: WORD_HUES[0]/360},
+    uWordHueB:  {value: WORD_HUES[0]/360},
   }
 
-  const mat = new THREE.ShaderMaterial({
-    vertexShader: VERT, fragmentShader: FRAG, uniforms,
-    blending:    THREE.AdditiveBlending,
-    depthWrite:  false, depthTest: false,
-    transparent: true,
-  })
+  scene.add(new THREE.Points(geo, new THREE.ShaderMaterial({
+    vertexShader:VERT, fragmentShader:FRAG, uniforms,
+    blending:THREE.AdditiveBlending,
+    depthWrite:false, depthTest:false, transparent:true,
+  })))
 
-  const points = new THREE.Points(geo, mat)
-  scene.add(points)
+  // ── State ────────────────────────────────────────────────
+  let wordIdx   = 0       // A side (settled word)
+  let nextIdx   = 1       // B side (target)
+  let morphT    = 0       // 0..1 shader morph value
+  let morphVel  = 0       // spring velocity for snap
+  let morphMode = 'idle'  // idle | scroll | snap-fwd | snap-back | click | auto
 
-  // ── State ──────────────────────────────────────────────
-  let wordIdx    = 0       // current word (A side)
-  let nextWordIdx= 1       // next word (B side)
-  let morphing   = false
-  let morphT     = 0       // 0→1
+  // Scroll state
+  let scrollAccum    = 0          // accumulated wheel delta
+  let scrollIdleTime = 0          // seconds since last wheel event
+  const SCROLL_FULL  = 700        // wheel px to complete a full morph
+  const SCROLL_IDLE_SNAP = 0.18   // seconds of no scroll before snap
 
-  let introC     = 0
-  let scrollRaw  = 0, scrollS = 0
-  let mouse      = new THREE.Vector2(0,0)
-  let mouseS     = new THREE.Vector2(0,0)
-  let hasMoved   = false
-  let prev       = performance.now()
-  let t          = 0
-  let globalProx = 0       // for cursor proximity ring
+  // Auto morph
+  let autoTimer   = 0
+  const AUTO_SEC  = 5.0
 
-  // Auto-morph timer
-  let autoMorphTimer = 0
-  const AUTO_MORPH_INTERVAL = 4.0 // seconds
+  let introC      = 0
+  let scrollRaw   = 0, scrollS = 0
+  let mouse       = new THREE.Vector2(0,0)
+  let mouseS      = new THREE.Vector2(0,0)
+  let hasMoved    = false
+  let prev        = performance.now()
+  let t           = 0
+  let nearProxy   = 0
 
-  // ── Cursor ─────────────────────────────────────────────
-  const cursor = new Cursor()
+  const cursor    = new Cursor()
+  const numEl     = document.getElementById('word-num')
+  const nameEl    = document.getElementById('word-name')
+  const scrubEl   = document.getElementById('scrub-bar')
+  const accentEl  = document.getElementById('accent-bar')
 
-  // ── UI refs ────────────────────────────────────────────
-  const hintEl     = document.getElementById('hint')
-  const labelEl    = document.getElementById('word-label')
-  const counterEl  = document.getElementById('word-counter')
-  const progressEl = document.getElementById('progress')
+  // Convert word hue → CSS hsl colour
+  function hueToCSS(h){ return `hsl(${h},80%,62%)` }
 
-  function updateUI(){
-    const n = String(wordIdx+1).padStart(2,'0')
-    const t = String(WORDS.length).padStart(2,'0')
-    counterEl.textContent = `${n} / ${t}`
-    labelEl.textContent   = WORDS[wordIdx]
+  function updateUI(idx){
+    numEl.textContent  = `${String(idx+1).padStart(2,'0')} / ${String(WORDS.length).padStart(2,'0')}`
+    nameEl.textContent = WORDS[idx]
+    // Accent bar colour
+    accentEl.style.setProperty('--word-color', hueToCSS(WORD_HUES[idx]))
+    accentEl.classList.add('show')
+    // Bloom tint — slightly shift bloom hue per word
+    const h = WORD_HUES[idx]/360
+    uniforms.uWordHueA.value = h
+    document.title = WORDS[idx]
   }
-  updateUI()
 
-  // ── Start a morph to a specific word index ─────────────
-  function startMorph(toIdx){
-    if(morphing) return
-    nextWordIdx = toIdx
-    // Set aOriginA = current settled A, aOriginB = next word
-    // First bake the current (morphed) position into A:
-    const curBlend = uniforms.uMorphT.value
-    const posA = wordPositions[wordIdx]
-    const posB = wordPositions[nextWordIdx]
+  // ── Bake current blend into A, set new B ────────────────
+  function setMorphTargets(fromIdx, toIdx){
+    const A = wordPos[fromIdx], B = wordPos[toIdx]
+    const curMt = uniforms.uMorphT.value
     const baked = new Float32Array(N*3)
-    for(let i=0;i<N*3;i++) baked[i] = posA[i]*(1-curBlend) + posB[i]*curBlend
+    for(let i=0;i<N*3;i++) baked[i]=A[i]*(1-curMt)+B[i]*curMt
 
     geo.attributes.aOriginA.array.set(baked)
-    geo.attributes.aOriginA.needsUpdate = true
-    geo.attributes.aOriginB.array.set(wordPositions[nextWordIdx])
-    geo.attributes.aOriginB.needsUpdate = true
-
-    morphT = 0
-    uniforms.uMorphT.value = 0
-    morphing = true
-    autoMorphTimer = 0
+    geo.attributes.aOriginA.needsUpdate=true
+    geo.attributes.aOriginB.array.set(wordPos[toIdx])
+    geo.attributes.aOriginB.needsUpdate=true
+    uniforms.uMorphT.value=0
+    uniforms.uWordHueB.value = WORD_HUES[toIdx]/360
+    morphT=0; morphVel=0
+    nextIdx=toIdx
   }
 
-  function morphNext(){ startMorph((wordIdx+1) % WORDS.length) }
+  // ── Morph complete callback ──────────────────────────────
+  function onMorphComplete(){
+    wordIdx = nextIdx
+    nextIdx = (wordIdx+1) % WORDS.length
+    // Bake completed word into A, reset B=same
+    geo.attributes.aOriginA.array.set(wordPos[wordIdx])
+    geo.attributes.aOriginA.needsUpdate=true
+    geo.attributes.aOriginB.array.set(wordPos[wordIdx])
+    geo.attributes.aOriginB.needsUpdate=true
+    uniforms.uWordHueA.value = WORD_HUES[wordIdx]/360
+    uniforms.uWordHueB.value = WORD_HUES[wordIdx]/360
+    uniforms.uMorphT.value=0
+    morphT=0; morphVel=0
+    morphMode='idle'
+    autoTimer=0
+    scrollAccum=0
+    updateUI(wordIdx)
+    fireShockwave()
+  }
 
-  // ── Events ─────────────────────────────────────────────
+  // ── Trigger morph programmatically ──────────────────────
+  function triggerMorph(mode='click'){
+    if(morphMode==='scroll') return  // let scroll finish
+    const to=(wordIdx+1)%WORDS.length
+    setMorphTargets(wordIdx, to)
+    morphMode=mode
+    autoTimer=0
+  }
+
+  updateUI(0)
+
+  // ── Events ──────────────────────────────────────────────
   window.addEventListener('mousemove',e=>{
     mouse.x=(e.clientX/W())*2-1
     mouse.y=-(e.clientY/H())*2+1
-    cursor.setPos(e.clientX, e.clientY)
-    if(!hasMoved){
-      hasMoved=true
-      hintEl.classList.add('gone')
-    }
+    cursor.move(e.clientX,e.clientY)
+    if(!hasMoved){ hasMoved=true; document.getElementById('hint').classList.add('gone') }
+    // Reset auto timer on interaction
+    if(morphMode==='idle'||morphMode==='auto') autoTimer=0
   })
   window.addEventListener('mouseleave',()=>{
     mouse.set(0,0); cursor.hide()
@@ -428,94 +460,153 @@ async function init(){
     const t0=e.touches[0]
     mouse.x=(t0.clientX/W())*2-1
     mouse.y=-(t0.clientY/H())*2+1
-    cursor.setPos(t0.clientX,t0.clientY)
+    cursor.move(t0.clientX,t0.clientY)
   },{passive:true})
+
+  // ── WHEEL → physical scroll-drag morph ──────────────────
   window.addEventListener('wheel',e=>{
+    e.preventDefault()
     const f=e.deltaMode===1?28:e.deltaMode===2?500:1
-    scrollRaw=Math.max(-Math.PI/1.5,Math.min(Math.PI/1.5,scrollRaw+e.deltaY*f*.00046))
-  },{passive:true})
+    const delta=e.deltaY*f
+
+    // Scroll also tweaks rotation for visual feedback
+    scrollRaw=Math.max(-Math.PI/1.6,Math.min(Math.PI/1.6,scrollRaw+delta*.00040))
+
+    // If idle/auto, start a scroll morph
+    if(morphMode==='idle'||morphMode==='auto'){
+      setMorphTargets(wordIdx,(wordIdx+1)%WORDS.length)
+      morphMode='scroll'
+      scrollAccum=0
+    }
+
+    if(morphMode==='scroll'){
+      scrollAccum=Math.max(0,Math.min(SCROLL_FULL,scrollAccum+Math.abs(delta)))
+      morphT = scrollAccum/SCROLL_FULL
+      uniforms.uMorphT.value=morphT
+      scrollIdleTime=0
+      autoTimer=0
+    }
+  },{passive:false})
+
+  // ── CLICK → instant snap-forward morph ──────────────────
   canvas.addEventListener('click',()=>{
     cursor.click()
-    if(!morphing) morphNext()
-    if(!hasMoved){ hasMoved=true; hintEl.classList.add('gone') }
+    if(morphMode==='idle'||morphMode==='auto'){
+      triggerMorph('click')
+    } else if(morphMode==='scroll'){
+      // Force snap forward from wherever scroll is
+      morphMode='snap-fwd'
+    }
+    if(!hasMoved){ hasMoved=true; document.getElementById('hint').classList.add('gone') }
+    autoTimer=0
   })
+
   window.addEventListener('resize',()=>{
     renderer.setSize(W(),H())
     composer.setSize(W(),H())
-    bloomPass.resolution.set(W()*DPR,H()*DPR)
-    cam.aspect=W()/H(); cam.updateProjectionMatrix()
+    bloom.resolution.set(W()*DPR,H()*DPR)
+    cam.aspect=W()/H()
+    cam.updateProjectionMatrix()
     uniforms.uRes.value.set(W(),H())
   })
 
-  // ── Render loop ────────────────────────────────────────
+  // ════════════════════════════════════════════════════════
+  //  RENDER LOOP
+  // ════════════════════════════════════════════════════════
   ;(function tick(){
     requestAnimationFrame(tick)
     const now=performance.now()
-    const dt =Math.min((now-prev)/1000,.05)
+    const dt=Math.min((now-prev)/1000,.05)
     prev=now; t+=dt
 
-    // Intro spring
-    introC += (1-introC)*Math.min(dt*.62,.04)
-    uniforms.uIntro.value = Math.min(introC,1)
+    // ── Intro spring ──────────────────────────────────────
+    introC+=(1-introC)*Math.min(dt*.60,.04)
+    uniforms.uIntro.value=Math.min(introC,1)
 
-    // Morph progress
-    if(morphing){
-      morphT += dt * 0.55    // ~1.8s full morph
-      if(morphT >= 1){
-        morphT   = 1
-        morphing = false
-        wordIdx  = nextWordIdx
-        // Bake completed morph into A, reset B=A
-        geo.attributes.aOriginA.array.set(wordPositions[wordIdx])
-        geo.attributes.aOriginA.needsUpdate=true
-        geo.attributes.aOriginB.array.set(wordPositions[wordIdx])
-        geo.attributes.aOriginB.needsUpdate=true
-        uniforms.uMorphT.value=0
-        updateUI()
-        autoMorphTimer=0
-      } else {
-        uniforms.uMorphT.value = morphT
+    // ── State machine ─────────────────────────────────────
+    if(morphMode==='scroll'){
+      scrollIdleTime+=dt
+      // Update scrub bar
+      scrubEl.style.width=(morphT*100)+'%'
+      scrubEl.style.opacity='1'
+
+      if(scrollIdleTime>SCROLL_IDLE_SNAP){
+        // User stopped scrolling — snap decision
+        morphMode = morphT>0.50 ? 'snap-fwd' : 'snap-back'
       }
     }
 
-    // Progress bar (shows auto-morph countdown)
-    if(!morphing){
-      autoMorphTimer += dt
-      const pct = Math.min(autoMorphTimer/AUTO_MORPH_INTERVAL*100,100)
-      progressEl.style.width = pct+'%'
-      if(autoMorphTimer >= AUTO_MORPH_INTERVAL) morphNext()
-    } else {
-      progressEl.style.width = (morphT*100)+'%'
+    else if(morphMode==='snap-fwd'){
+      // Spring morphT toward 1
+      const STIFF=0.18, DAMP=0.72
+      morphVel = morphVel*DAMP + (1.0-morphT)*STIFF
+      morphT   = Math.min(morphT+morphVel*dt*60, 1.0)
+      uniforms.uMorphT.value=morphT
+      scrubEl.style.width=(morphT*100)+'%'
+      if(morphT>=0.999){ morphT=1; onMorphComplete(); scrubEl.style.opacity='0' }
     }
 
-    // Mouse smooth
-    mouseS.lerp(mouse, 1-Math.pow(.025,dt))
+    else if(morphMode==='snap-back'){
+      // Spring morphT toward 0
+      const STIFF=0.18, DAMP=0.72
+      morphVel = morphVel*DAMP + (0.0-morphT)*STIFF
+      morphT   = Math.max(morphT+morphVel*dt*60, 0.0)
+      uniforms.uMorphT.value=morphT
+      scrubEl.style.width=(morphT*100)+'%'
+      if(morphT<=0.001){
+        morphT=0; morphVel=0; morphMode='idle'; scrollAccum=0
+        scrubEl.style.opacity='0'
+        // Revert B back to A (no morph)
+        geo.attributes.aOriginB.array.set(wordPos[wordIdx])
+        geo.attributes.aOriginB.needsUpdate=true
+        uniforms.uWordHueB.value=WORD_HUES[wordIdx]/360
+      }
+    }
+
+    else if(morphMode==='click'||morphMode==='auto'){
+      // Smooth spring morph
+      const STIFF=0.15, DAMP=0.75
+      morphVel = morphVel*DAMP + (1.0-morphT)*STIFF
+      morphT   = Math.min(morphT+morphVel*dt*60, 1.0)
+      uniforms.uMorphT.value=morphT
+      scrubEl.style.width=(morphT*100)+'%'
+      scrubEl.style.opacity='1'
+      if(morphT>=0.999){ morphT=1; onMorphComplete(); scrubEl.style.opacity='0' }
+    }
+
+    else if(morphMode==='idle'){
+      autoTimer+=dt
+      // Show auto-morph countdown in accent bar opacity
+      const pct=Math.min(autoTimer/AUTO_SEC,1)
+      scrubEl.style.width=(pct*100)+'%'
+      scrubEl.style.opacity=String(0.08+pct*0.18)
+      if(autoTimer>=AUTO_SEC){ triggerMorph('auto') }
+    }
+
+    // ── Mouse smooth ──────────────────────────────────────
+    mouseS.lerp(mouse,1-Math.pow(.025,dt))
     uniforms.uMouse.value.copy(mouseS)
 
-    // Scroll spring-back
-    scrollRaw *= .974
-    scrollS   += (scrollRaw-scrollS)*Math.min(dt*3.,.12)
-    uniforms.uScrollRot.value = scrollS
+    // ── Scroll Y-rotation spring-back ─────────────────────
+    scrollRaw*=.972
+    scrollS  +=(scrollRaw-scrollS)*Math.min(dt*3.,.12)
+    uniforms.uScrollRot.value=scrollS
 
-    // Camera parallax
-    cam.position.x += (camBase.x + mouseS.x*.12 - cam.position.x)*.05
-    cam.position.y += (camBase.y + mouseS.y*.07 - cam.position.y)*.05
+    // ── Camera parallax ──────────────────────────────────
+    cam.position.x+=(camBase.x+mouseS.x*.13-cam.position.x)*.05
+    cam.position.y+=(camBase.y+mouseS.y*.08-cam.position.y)*.05
     cam.lookAt(0,0,0)
 
-    uniforms.uTime.value = t
+    // ── Proximity for cursor ring ─────────────────────────
+    const inBox = Math.abs(mouseS.x)<0.70 && Math.abs(mouseS.y)<0.25
+    nearProxy+=(((inBox?1:0)-nearProxy))*Math.min(dt*4,.15)
+    cursor.update(dt, nearProxy)
 
-    // Global proximity estimate for cursor ring
-    // Approximate: if mouse NDC is within text bounding rect
-    const mx=mouseS.x, my=mouseS.y
-    const inTextArea = Math.abs(mx)<0.75 && Math.abs(my)<0.22
-    globalProx += ((inTextArea?1:0) - globalProx)*Math.min(dt*4,.15)
-    cursor.update(dt, globalProx)
-
-    // Render via composer (bloom)
+    uniforms.uTime.value=t
     composer.render()
   })()
 
-  console.log('[Quantum] ✓ running — bloom + morph + cursor active')
+  console.log('[FX] ✓  bloom + morph + scroll-drag + cursor running')
 }
 
-init().catch(e=>console.error('[Quantum] Error:', e))
+init().catch(e=>console.error('[FX] Fatal:', e))
